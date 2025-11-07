@@ -1,15 +1,17 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
+using BuildableBossStone.Managers;
 using HarmonyLib;
 using JetBrains.Annotations;
+using PieceManager;
 using ServerSync;
 using UnityEngine;
-using Object = UnityEngine.Object;
 
 namespace BuildableBossStone
 {
@@ -17,30 +19,34 @@ namespace BuildableBossStone
     public class BuildableBossStonePlugin : BaseUnityPlugin
     {
         internal const string ModName = "BuildableBossStones";
-        internal const string ModVersion = "1.0.5";
+        internal const string ModVersion = "1.1.1";
         internal const string Author = "RustyMods";
         private const string ModGUID = Author + "." + ModName;
-        private static string ConfigFileName = ModGUID + ".cfg";
-        private static string ConfigFileFullPath = Paths.ConfigPath + Path.DirectorySeparatorChar + ConfigFileName;
+        private static readonly string ConfigFileName = ModGUID + ".cfg";
+        private static readonly string ConfigFileFullPath = Paths.ConfigPath + Path.DirectorySeparatorChar + ConfigFileName;
         internal static string ConnectionError = "";
         private readonly Harmony _harmony = new(ModGUID);
         public static readonly ManualLogSource BuildableBossStoneLogger = BepInEx.Logging.Logger.CreateLogSource(ModName);
         private static readonly ConfigSync ConfigSync = new(ModGUID) { DisplayName = ModName, CurrentVersion = ModVersion, MinimumRequiredVersion = ModVersion };
-
         private enum Toggle { On = 1, Off = 0 }
 
-        private static BuildableBossStonePlugin _plugin = null!;
         private static GameObject Root = null!;
+        private static ConfigEntry<Toggle> _serverConfigLocked = null!;
+        private static readonly List<GameObject> PrefabsToRegister = new();
+        private static readonly List<Clone> Clones = new();
+        private static bool IsClonedBossStone(string name) => m_pieceNames.Contains(name);
+        
+        private static readonly List<string> m_pieceNames = new();
+        private static readonly List<BuildPiece> m_pieces = new();
 
-        private static Dictionary<string, GameObject> m_registeredBossStones = new();
-
+        private static bool m_initiated;
+        private static bool m_snapped;
         public void Awake()
         {
-            _plugin = this;
             Root = new GameObject("root");
             Root.SetActive(false);
             DontDestroyOnLoad(Root);
-            
+
             InitConfigs();
             
             Assembly assembly = Assembly.GetExecutingAssembly();
@@ -53,142 +59,140 @@ namespace BuildableBossStone
             Config.Save();
         }
         
-        [HarmonyPatch(typeof(ZNetScene), nameof(ZNetScene.Awake))]
-        private static class RegisterBossStones
+        [HarmonyPriority(Priority.VeryHigh)]
+        [HarmonyPatch(typeof(FejdStartup), nameof(FejdStartup.Awake))]
+        private static class FejdStartup_Awake_Patch
         {
-            private static void Postfix(ZNetScene __instance)
+            [UsedImplicitly]
+            private static void Postfix(FejdStartup __instance)
             {
-                if (!__instance) return;
-                InitBossStones(__instance);
+                Helpers._ZNetScene = __instance.m_objectDBPrefab.GetComponent<ZNetScene>();
+                Helpers._ObjectDB = __instance.m_objectDBPrefab.GetComponent<ObjectDB>();
+                Setup();
+                foreach(Clone? clone in Clones) clone.Create();
+                BuildPiece.Patch_FejdStartup(__instance);
+            }
+        }
+
+
+        [HarmonyPatch(typeof(ZNetScene), nameof(ZNetScene.Awake))]
+        private static class ZNetScene_Awake_Patch
+        {
+            [UsedImplicitly]
+            private static void Prefix(ZNetScene __instance)
+            {
+                foreach (GameObject prefab in PrefabsToRegister)
+                {
+                    if (!prefab.GetComponent<ZNetView>()) continue;
+                    __instance.m_prefabs.Add(prefab);
+                }
+            }
+        }
+
+        private static void RegisterPrefab(GameObject? prefab)
+        {
+            if (prefab == null) return;
+            PrefabsToRegister.Add(prefab);
+        }
+
+        private static void Setup()
+        {
+            if (m_initiated || Helpers._ZNetScene == null) return;
+
+            Piece? piece = Helpers.GetPrefab("piece_stonecutter")!.GetComponent<Piece>();
+            WearNTear? wear = Helpers.GetPrefab("stone_wall_1x1")!.GetComponent<WearNTear>();
+            
+            foreach (GameObject? prefab in Helpers._ZNetScene.m_prefabs.Where(x => x != null && x.GetComponent<BossStone>()))
+            {
+                BuildableBossStoneLogger.LogDebug($"Creating prefab: piece_{prefab.name}");
+                Clone clone = new Clone(prefab.name, $"piece_{prefab.name}");
+                clone.OnCreated += go =>
+                {
+                    MeshRenderer? renderer = go.transform.GetChild(0).GetComponent<MeshRenderer>();
+                    RuneStone? runestone = go.GetComponentInChildren<RuneStone>();
+                    m_pieceNames.Add(go.name);
+                    Piece component = go.AddComponent<Piece>();
+                    GameObject model = SetUnderModel(go);
+                    WearNTear wearNTear = go.AddComponent<WearNTear>();
+                    wearNTear.m_new = model;
+                    wearNTear.m_worn = model;
+                    wearNTear.m_broken = model;
+                    wearNTear.m_supports = false;
+                    wearNTear.m_noRoofWear = true;
+                    wearNTear.m_noSupportWear = true;
+                    wearNTear.m_materialType = WearNTear.MaterialType.Stone;
+                    wearNTear.m_health = 1500f;
+                    wearNTear.m_destroyedEffect = wear.m_destroyedEffect;
+                    wearNTear.m_hitEffect = wear.m_hitEffect;
+                    wearNTear.m_autoCreateFragments = true;
+                    component.m_description = runestone.m_text;
+                    component.m_placeEffect = piece.m_placeEffect;
+                    component.enabled = true;
+
+                    GameObject collider = new GameObject("collider");
+                    BoxCollider boxCollider = collider.AddComponent<BoxCollider>();
+                    collider.transform.SetParent(go.transform);
+                    Bounds bounds = renderer.bounds;
+                
+                    boxCollider.size = new Vector3(1f, bounds.size.y);
+                    boxCollider.center = bounds.center;
+
+                    BuildPiece buildPiece = new BuildPiece(go);
+                    buildPiece.Name.English(prefab.name.Replace("_", " "));
+                    buildPiece.Category.Set("Boss Stones");
+                    buildPiece.Crafting.Set(CraftingTable.Workbench);
+                    buildPiece.RequiredItems.Add("Stone", 100, true);
+                    buildPiece.RequiredItems.Add("Flint", 20, true);
+                    m_pieces.Add(buildPiece);
+                };
+            }
+            
+            m_initiated = true;
+        }
+
+        [HarmonyPatch(typeof(Piece), nameof(Piece.DropResources))]
+        private static class Piece_DropResources_Patch
+        {
+            [UsedImplicitly]
+            private static void Postfix(Piece __instance)
+            {
+                if (!ObjectDB.instance || !IsClonedBossStone(__instance.name.Replace("(Clone)", string.Empty))) return;
+                ItemStand itemStand = __instance.GetComponentInChildren<ItemStand>();
+                if (!itemStand) return;
+                string trophy = itemStand.GetAttachedItem();
+                if (trophy.IsNullOrWhiteSpace()) return;
+                GameObject item = ObjectDB.instance.GetItemPrefab(trophy);
+                if (!item) return;
+                Instantiate(item, __instance.transform.position + Vector3.up, Quaternion.identity);
             }
         }
         
-        private static void InitBossStones(ZNetScene instance)
+        [HarmonyPatch(typeof(Player), nameof(Player.OnSpawned))]
+        private static class Player_OnSpawned_Patch
         {
-            GameObject hammer = instance.GetPrefab("Hammer");
-            if (!hammer) return;
-            if (!hammer.TryGetComponent(out ItemDrop itemDrop)) return;
-            
-            GameObject stoneCutter = instance.GetPrefab("piece_stonecutter");
-            if (!stoneCutter) return;
-            if (!stoneCutter.TryGetComponent(out Piece piece)) return;
-            
-            foreach (GameObject? prefab in instance.m_prefabs.FindAll(x => x.name.StartsWith("BossStone")))
+            [UsedImplicitly]
+            private static void Postfix()
             {
-                if (!prefab.transform.GetChild(0).TryGetComponent(out MeshRenderer renderer)) continue;
-
-                if (!prefab.TryGetComponent(out RuneStone runeStone)) continue;
-                var itemStand = prefab.GetComponentInChildren<ItemStand>(true);
-                if (!itemStand) continue;
-               
-                GameObject clone = Instantiate(prefab, Root.transform, false);
-                clone.name = "piece_" + prefab.name;
-
-                Piece component = clone.AddComponent<Piece>();
-
-                ConfigEntry<Piece.PieceCategory> categoryConfig = _plugin.config(prefab.name, "Category", Piece.PieceCategory.Misc, "Set category of boss stone");
-                component.m_category = categoryConfig.Value;
-                categoryConfig.SettingChanged += OnBossStoneConfigChange;
-                
-                component.m_icon = itemStand.m_supportedItems[0]?.m_itemData.GetIcon();
-
-                ConfigEntry<string> resourceConfig = _plugin.config(prefab.name, "Resources", "Stone:100,Flint:20",
-                    "Set the resources to build, [prefab]:[amount]");
-                resourceConfig.SettingChanged += OnBossStoneConfigChange;
-
-                List<Piece.Requirement> requirements = new();
-
-                foreach (var data in resourceConfig.Value.Split(','))
-                {
-                    var info = data.Split(':');
-                    if (info.Length != 2) continue;
-                    GameObject item = instance.GetPrefab(info[0]);
-                    if (!item.TryGetComponent(out ItemDrop resourceDrop)) continue;
-                    if (!item) continue;
-                    if (!int.TryParse(info[1], out int amount)) continue;
-                    requirements.Add(new Piece.Requirement()
-                    {
-                        m_resItem = resourceDrop,
-                        m_recover = true,
-                        m_amount = amount
-                    });
-                }
-
-                component.m_resources = requirements.ToArray();
-
-                ConfigEntry<string> nameConfig = _plugin.config(prefab.name, "Display Name",
-                    prefab.name.Replace("BossStone_", "Boss Stone "), "Set the display name of boss stone");
-                nameConfig.SettingChanged += OnBossStoneConfigChange;
-
-                component.m_name = nameConfig.Value;
-                component.m_description = runeStone.m_text;
-                component.m_placeEffect = piece.m_placeEffect;
-
-                component.enabled = true;
-
-                GameObject collider = new GameObject("collider");
-                BoxCollider boxCollider = collider.AddComponent<BoxCollider>();
-                collider.transform.SetParent(clone.transform);
-                var bounds = renderer.bounds;
-                
-                boxCollider.size = new Vector3(1f, bounds.size.y);
-                boxCollider.center = bounds.center;
-                
-                instance.m_prefabs.Add(clone);
-                instance.m_namedPrefabs[clone.name.GetStableHashCode()] = clone; 
-                
-                itemDrop.m_itemData.m_shared.m_buildPieces.m_pieces.Add(clone);
-
-                m_registeredBossStones[clone.name] = clone;
+                if (m_snapped) return;
+                foreach (var piece in m_pieces) piece.Snapshot();
+                m_snapped = true;
             }
         }
-
-        private static void OnBossStoneConfigChange(object sender, EventArgs e)
+        private static GameObject SetUnderModel(GameObject prefab)
         {
-            var instance = ZNetScene.instance;
-            if (!instance) return;
-            if (sender is ConfigEntry<Piece.PieceCategory> categoryConfig)
+            List<Transform> children = new();
+            foreach (Transform child in prefab.transform)
             {
-                var prefab = instance.GetPrefab("piece_" + categoryConfig.Definition.Section);
-                if (!prefab) return;
-                if (!prefab.TryGetComponent(out Piece component)) return;
-                component.m_category = categoryConfig.Value;
+                children.Add(child);
+            }
+            GameObject model = new GameObject("model");
+            model.transform.parent = prefab.transform;
+            foreach (var child in children)
+            {
+                child.parent = model.transform;
             }
 
-            if (sender is ConfigEntry<string> stringConfigs)
-            {
-                var prefab = instance.GetPrefab("piece_" + stringConfigs.Definition.Section);
-                if (!prefab) return;
-                if (!prefab.TryGetComponent(out Piece component)) return;
-
-                if (stringConfigs.Definition.Key == "Display Name")
-                {
-                    component.m_name = stringConfigs.Value;
-                }
-
-                if (stringConfigs.Definition.Key == "Resources")
-                {
-                    List<Piece.Requirement> requirements = new();
-
-                    foreach (var data in stringConfigs.Value.Split(','))
-                    {
-                        var info = data.Split(':');
-                        if (info.Length != 2) continue;
-                        GameObject item = instance.GetPrefab(info[0]);
-                        if (!item.TryGetComponent(out ItemDrop resourceDrop)) continue;
-                        if (!item) continue;
-                        if (!int.TryParse(info[1], out int amount)) continue;
-                        requirements.Add(new Piece.Requirement()
-                        {
-                            m_resItem = resourceDrop,
-                            m_recover = true,
-                            m_amount = amount
-                        });
-                    }
-
-                    component.m_resources = requirements.ToArray();
-                }
-            }
+            return model;
         }
 
         private void SetupWatcher()
@@ -216,12 +220,6 @@ namespace BuildableBossStone
                 BuildableBossStoneLogger.LogError("Please check your config entries for spelling and format!");
             }
         }
-
-
-        #region ConfigOptions
-
-        private static ConfigEntry<Toggle> _serverConfigLocked = null!;
-
         private void InitConfigs()
         {
             _serverConfigLocked = config("1 - General", "Lock Configuration", Toggle.On,
@@ -238,8 +236,6 @@ namespace BuildableBossStone
                     (synchronizedSetting ? " [Synced with Server]" : " [Not Synced with Server]"),
                     description.AcceptableValues, description.Tags);
             ConfigEntry<T> configEntry = Config.Bind(group, name, value, extendedDescription);
-            //var configEntry = Config.Bind(group, name, value, description);
-
             SyncedConfigEntry<T> syncedConfigEntry = ConfigSync.AddConfigEntry(configEntry);
             syncedConfigEntry.SynchronizedConfig = synchronizedSetting;
 
@@ -259,20 +255,34 @@ namespace BuildableBossStone
             [UsedImplicitly] public string? Category = null!;
             [UsedImplicitly] public Action<ConfigEntryBase>? CustomDrawer = null!;
         }
-
-        class AcceptableShortcuts : AcceptableValueBase
+        
+        public class Clone
         {
-            public AcceptableShortcuts() : base(typeof(KeyboardShortcut))
+            public static readonly Dictionary<string, GameObject> registeredPrefabs = new();
+            private GameObject? Prefab;
+            private readonly string PrefabName;
+            private readonly string NewName;
+            private bool Loaded;
+            public event Action<GameObject>? OnCreated;
+
+            public Clone(string prefabName, string newName)
             {
+                PrefabName = prefabName;
+                NewName = newName;
+                Clones.Add(this);
             }
 
-            public override object Clamp(object value) => value;
-            public override bool IsValid(object value) => true;
-
-            public override string ToDescriptionString() =>
-                "# Acceptable values: " + string.Join(", ", UnityInput.Current.SupportedKeyCodes);
+            internal void Create()
+            {
+                if (Loaded) return;
+                if (Helpers.GetPrefab(PrefabName) is not { } prefab) return;
+                Prefab = Instantiate(prefab, Root.transform, false);
+                Prefab.name = NewName;
+                RegisterPrefab(Prefab);
+                OnCreated?.Invoke(Prefab);
+                registeredPrefabs[Prefab.name] = Prefab;
+                Loaded = true;
+            }
         }
-
-        #endregion
     }
 }

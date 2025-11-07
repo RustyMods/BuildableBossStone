@@ -10,7 +10,7 @@
         <AppDesignerFolder>Properties</AppDesignerFolder>
         <RootNamespace>BuildableBossStone</RootNamespace>
         <AssemblyName>BuildableBossStone</AssemblyName>
-        <TargetFrameworkVersion>v4.6.2</TargetFrameworkVersion>
+        <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
         <FileAlignment>512</FileAlignment>
         <LangVersion>10</LangVersion>
         <Nullable>enable</Nullable>
@@ -109,6 +109,8 @@
         </Reference>
     </ItemGroup>
     <ItemGroup>
+        <Compile Include="Managers\Helpers.cs" />
+        <Compile Include="Managers\PieceManager.cs" />
         <Compile Include="Plugin.cs" />
         <Compile Include="Properties\AssemblyInfo.cs" />
         <Compile Include="VersionHandshake.cs" />
@@ -120,7 +122,6 @@
         <Content Include=".gitignore" />
         <Content Include="environment.props" />
         <Content Include="ILRepack.targets" />
-        <Content Include="Libs\PieceManager.dll" />
         <Content Include="Libs\ServerSync.dll" />
         <Content Include="UpdateManifest.ps1" />
     </ItemGroup>
